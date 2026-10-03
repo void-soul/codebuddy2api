@@ -35,3 +35,6 @@ wheels/
 management-access.txt
 .idea/
 
+# 本地 QA 库（any-version 的记录文件，误落到本目录）
+qa.db
+
