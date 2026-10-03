@@ -271,6 +271,74 @@ NON_CHAT_MODEL_TAGS = {
     "text-to-video",
 }
 
+# 名称里出现这些片段的是补全/跳转等内部功能，不作为聊天模型暴露
+INTERNAL_MODEL_KEYWORDS = ("completion", "rewrite", "jump", "codewise")
+
+# 后端权威模型目录。客户端 UI 用的就是这份（客户端 asar 里叫 `remote.models`），
+# 新模型（例如 space-bunny）只会出现在这里 —— 本机 product.json 取决于 WorkBuddy
+# 装在哪、DEFAULT_MODELS 是手写快照，两者都会漏掉新模型。
+BACKEND_MODELS_PATH = "/v2/enterprises/personal/models"
+
+# 目录变化很慢，但客户端（Claude Code / Cline 等）会反复拉模型列表，不缓存就是每次都打后端
+MODEL_CACHE_TTL = 300.0
+_MODEL_CACHE: dict = {}
+
+
+def _filter_chat_models(models) -> list[str]:
+    """从 product.json / 后端目录的 models 数组里挑出聊天模型的 id。
+
+    两个来源结构一致（都带 id / tags / vendor），所以过滤规则只写一份：
+    排除图像/视频模型、vendor=tencent 的内部模型、补全类内部功能。
+    """
+    chat_models: list[str] = []
+    for model in models or []:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not model_id or not isinstance(model_id, str):
+            continue
+        # 非聊天模型
+        tags = model.get("tags") or []
+        if any(tag in NON_CHAT_MODEL_TAGS for tag in tags):
+            continue
+        # 内部模型（vendor 为 tencent 的通常是补全/跳转等内部功能）
+        if model.get("vendor", "") == "tencent":
+            continue
+        # 名称中明显是补全/内部功能的模型
+        name_lower = model_id.lower()
+        if any(keyword in name_lower for keyword in INTERNAL_MODEL_KEYWORDS):
+            continue
+        chat_models.append(model_id)
+    return chat_models
+
+
+def _load_models_from_backend() -> list[str]:
+    """从后端取权威模型列表；不可用时返回空列表（由调用方决定回落）。
+
+    失败**不写缓存**：一次网络抖动不该把降级列表锁死 5 分钟。
+    """
+    cached = _MODEL_CACHE.get("ids")
+    if cached and (time.time() - _MODEL_CACHE.get("at", 0.0)) < MODEL_CACHE_TTL:
+        return list(cached)
+    try:
+        headers = _cred().get_headers()
+        with httpx.Client(timeout=15) as c:
+            r = c.get(f"{BACKEND}{BACKEND_MODELS_PATH}", headers=headers)
+        if r.status_code != 200:
+            return []
+        payload = r.json()
+    except Exception as e:  # noqa: BLE001
+        # 静默降级：模型列表拿不到不该让 /v1/models 报错
+        print(f"Warning: Failed to load models from backend: {e}", file=sys.stderr)
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    models = data.get("models") if isinstance(data, dict) else None
+    ids = _filter_chat_models(models)
+    if not ids:
+        return []
+    _MODEL_CACHE.update({"at": time.time(), "ids": ids})
+    return list(ids)
+
 
 def _find_workbuddy_product_json() -> Path | None:
     """
@@ -348,34 +416,8 @@ def _load_models_from_workbuddy() -> list[str]:
             data = json.load(f)
 
         models = data.get("models", [])
-        chat_models = []
-
-        for model in models:
-            model_id = model.get("id")
-            if not model_id:
-                continue
-
-            # 过滤掉非聊天模型
-            tags = model.get("tags", [])
-            if any(tag in NON_CHAT_MODEL_TAGS for tag in tags):
-                continue
-
-            # 过滤掉内部模型（vendor 为 tencent 的通常是补全/跳转等内部功能）
-            vendor = model.get("vendor", "")
-            if vendor == "tencent":
-                continue
-
-            # 过滤掉名称中明显是补全/内部功能的模型
-            name_lower = model_id.lower()
-            if any(
-                keyword in name_lower
-                for keyword in ["completion", "rewrite", "jump", "codewise"]
-            ):
-                continue
-
-            chat_models.append(model_id)
-
-        return chat_models
+        # 过滤规则与后端目录共用一份（_filter_chat_models）
+        return _filter_chat_models(models)
 
     except Exception as e:
         # 解析失败时静默降级，不影响服务启动
@@ -390,19 +432,22 @@ def get_available_models() -> list[str]:
     """
     获取可用的模型列表。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+    优先级：后端权威目录 → 本机 WorkBuddy product.json → 硬编码列表。
+    后端目录是客户端 UI 用的同一份数据，只有它能反映新模型（例如 space-bunny）；
+    前两者都拿不到时用硬编码列表兜底，保证 /v1/models 始终可用。
 
     Returns:
         模型 ID 列表
     """
-    workbuddy_models = _load_models_from_workbuddy()
+    backend_models = _load_models_from_backend()
+    if backend_models:
+        return backend_models
 
+    workbuddy_models = _load_models_from_workbuddy()
     if workbuddy_models:
-        # 成功从 WorkBuddy 加载，使用动态列表
         return workbuddy_models
-    else:
-        # 降级到硬编码列表
-        return DEFAULT_MODELS
+
+    return list(DEFAULT_MODELS)
 
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
